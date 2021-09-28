@@ -1,5 +1,6 @@
 use brotli;
 use bzip2::read::BzDecoder;
+use std::io::{self, ErrorKind};
 use std::vec::Vec;
 use std::{
     convert::TryInto,
@@ -97,7 +98,7 @@ fn read_bsdiff_int<R: Read + Seek>(reader: &mut R, ro: &ReadOptions, _: ()) -> B
     if raw & (1 << 63) == 0 {
         return Ok(raw.try_into().unwrap());
     } else {
-        let parsed: i64 = (raw & ((1 << 63) - 1)).try_into().unwrap();
+        let parsed: i64 = (raw & ((1 << 63) - 1)) as i64;
         return Ok(-parsed);
     }
 }
@@ -116,6 +117,8 @@ pub struct ControlEntry {
     #[br(parse_with=read_bsdiff_int)]
     offset_increment: i64,
 }
+// Control entry has 3 u64 fields, so 24 bytes in total.
+const CONTROL_ENTRY_SIZE: usize = 24;
 
 pub trait BinreadReader: Read + Seek {}
 
@@ -176,7 +179,18 @@ impl<'a> BsdiffReader<'a> {
     pub fn new(data: &'a [u8]) -> Result<BsdiffReader<'a>, binread::Error> {
         let mut reader = Cursor::new(data);
         let header = BsdiffFormat::read(&mut reader)?;
+        // header takes up 32 bytes, so control stream start at offset 32.
         let decompressed_ctrl_stream = Self::decompress(&data[32..], header.get_ctrl_compressor())?;
+        if decompressed_ctrl_stream.len() % CONTROL_ENTRY_SIZE != 0 {
+            return Err(binread::Error::Io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Decompressed ctrl stream has length {}, which is not a multiple of {}",
+                    decompressed_ctrl_stream.len(),
+                    CONTROL_ENTRY_SIZE
+                ),
+            )));
+        }
 
         return Ok(BsdiffReader {
             data,

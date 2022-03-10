@@ -13,10 +13,7 @@ fn dump_bspatch(payload: &[u8]) {
 }
 
 fn main() -> Result<(), i32> {
-    let mut args: Vec<String> = std::env::args().collect();
-    if args.len() == 1 {
-        args.push("test.bsdiff".to_string());
-    }
+    let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         println!("Usage: {} <bsdiff patch>", args[0]);
         return Err(1);

@@ -22,6 +22,18 @@ const fn as_u32_be(array: &[u8; 4]) -> u32 {
         | ((array[3] as u32) << 0)
 }
 
+const fn as_u32_le(array: &[u8; 4]) -> u32 {
+    ((array[3] as u32) << 24)
+        | ((array[2] as u32) << 16)
+        | ((array[1] as u32) << 8)
+        | ((array[0] as u32) << 0)
+}
+
+const fn as_u64_le(arr: &[u8; 8]) -> u64 {
+    return (as_u32_le(&[arr[0], arr[1], arr[2], arr[3]]) as u64)
+        | (as_u32_le(&[arr[4], arr[5], arr[6], arr[7]]) as u64) << 32;
+}
+
 const fn as_u64_be(arr: &[u8; 8]) -> u64 {
     return (as_u32_be(&[arr[0], arr[1], arr[2], arr[3]]) as u64) << 32
         | as_u32_be(&[arr[4], arr[5], arr[6], arr[7]]) as u64;
@@ -29,6 +41,7 @@ const fn as_u64_be(arr: &[u8; 8]) -> u64 {
 
 const LEGACY_BSDIFF_MAGIC: u64 = as_u64_be(b"BSDIFF40");
 const BSDIFF2_MAGIC: u64 = as_u64_be(b"BSDF2\x00\x00\x00");
+const BSDIFF3_MAGIC: u64 = as_u64_be(b"BDF3\x00\x00\x00\x00");
 
 fn is_valid_compressor_type(compressor_type: u8) -> bool {
     return compressor_type == 1 || compressor_type == 2;
@@ -44,14 +57,19 @@ fn to_compressor_type(compressor_type: u8) -> CompressorType {
 
 fn is_valid_bsdiff_magic(magic: u64) -> bool {
     let bytes = magic.to_be_bytes();
-    return magic & BSDIFF2_MAGIC == BSDIFF2_MAGIC
+    return (magic & BSDIFF2_MAGIC == BSDIFF2_MAGIC
         && is_valid_compressor_type(bytes[5])
         && is_valid_compressor_type(bytes[6])
-        && is_valid_compressor_type(bytes[7]);
+        && is_valid_compressor_type(bytes[7]))
+        || ((magic & BSDIFF3_MAGIC == BSDIFF3_MAGIC)
+            // && is_valid_compressor_type(bytes[4])
+            && is_valid_compressor_type(bytes[5])
+            && is_valid_compressor_type(bytes[6])
+            && is_valid_compressor_type(bytes[7]));
 }
 
 #[derive(BinRead)]
-#[br(assert(magic == LEGACY_BSDIFF_MAGIC || (magic & BSDIFF2_MAGIC) == BSDIFF2_MAGIC && is_valid_bsdiff_magic(magic)), little)]
+#[br(assert(magic == LEGACY_BSDIFF_MAGIC ||is_valid_bsdiff_magic(magic)), little)]
 #[derive(Debug, Clone, Copy)]
 pub struct BsdiffFormat {
     #[br(big)]
@@ -64,6 +82,9 @@ pub struct BsdiffFormat {
 impl BsdiffFormat {
     fn is_legacy_bsdiff_format(&self) -> bool {
         return self.magic == LEGACY_BSDIFF_MAGIC;
+    }
+    fn is_bsdiff3_format(&self) -> bool {
+        return self.magic & BSDIFF3_MAGIC == BSDIFF3_MAGIC;
     }
     fn get_ctrl_compressor(&self) -> CompressorType {
         return if self.is_legacy_bsdiff_format() {
@@ -179,6 +200,36 @@ impl<'a> BsdiffReader<'a> {
     pub fn new(data: &'a [u8]) -> Result<BsdiffReader<'a>, binread::Error> {
         let mut reader = Cursor::new(data);
         let header = BsdiffFormat::read(&mut reader)?;
+        if header.is_bsdiff3_format() {
+            let mut buf = [0 as u8; 8];
+            reader.read_exact(&mut buf).unwrap();
+            let compressed_mask_size = as_u64_le(&buf);
+            let compressed_diff_size = header.compressed_diff_size;
+            let compressed_diff_data = &data[32 + 8 + header.compressed_ctrl_size as usize..]
+                [..header.compressed_diff_size as usize];
+            let decompressed_diff_size =
+                Self::decompress(compressed_diff_data, header.get_ctrl_compressor())
+                    .unwrap()
+                    .len();
+            let compressed_mask_data = &data[data.len() - compressed_mask_size as usize..];
+            let decompressed_mask_size =
+                Self::decompress(compressed_mask_data, CompressorType::Brotli)
+                    .unwrap()
+                    .len();
+            println!(
+                "Mask data: {}/{} = {}, diff data: {}/{} = {}",
+                compressed_mask_size,
+                decompressed_mask_size,
+                compressed_mask_size as f32 / decompressed_mask_size as f32,
+                compressed_diff_size,
+                decompressed_diff_size,
+                compressed_diff_size as f32 / decompressed_diff_size as f32,
+            );
+            return Err(binread::Error::Io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "unsupported bsdiff3 format",
+            )));
+        }
         // header takes up 32 bytes, so control stream start at offset 32.
         let decompressed_ctrl_stream = Self::decompress(&data[32..], header.get_ctrl_compressor())?;
         if decompressed_ctrl_stream.len() % CONTROL_ENTRY_SIZE != 0 {
@@ -191,6 +242,21 @@ impl<'a> BsdiffReader<'a> {
                 ),
             )));
         }
+        let compressed_diff_stream = &data[32 + header.compressed_ctrl_size as usize..]
+            [..header.compressed_diff_size as usize];
+        let decompressed_diff_stream =
+            Self::decompress(compressed_diff_stream, header.get_diff_compressor())?;
+        let diff_stream_size = decompressed_diff_stream.len();
+        let diff_stream_zero_count = decompressed_diff_stream
+            .into_iter()
+            .map(|x| (x == 0) as u32)
+            .sum::<u32>();
+        println!(
+            "Diff stream has {}/{} = {}% zeros",
+            diff_stream_zero_count,
+            diff_stream_size,
+            (diff_stream_zero_count as f64) / diff_stream_size as f64 * 100.0
+        );
 
         return Ok(BsdiffReader {
             data,
